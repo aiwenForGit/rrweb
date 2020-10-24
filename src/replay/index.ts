@@ -27,7 +27,13 @@ import {
   inputData,
   canvasMutationData,
 } from '../types';
-import { mirror, polyfill, TreeIndex } from '../utils';
+import {
+  mirror,
+  polyfill,
+  TreeIndex,
+  queueToResolveTrees,
+  iterateResolveTree,
+} from '../utils';
 import getInjectStyleRules from './styles/inject-style';
 import './styles/style.css';
 
@@ -46,20 +52,6 @@ const defaultMouseTailConfig = {
   lineWidth: 3,
   strokeStyle: 'red',
 } as const;
-const defaultConfig: playerConfig = {
-  speed: 1,
-  root: document.body,
-  loadTimeout: 0,
-  skipInactive: false,
-  showWarning: true,
-  showDebug: false,
-  blockClass: 'rr-block',
-  liveMode: false,
-  insertStyleRules: [],
-  triggerFocus: true,
-  UNSAFE_replayCanvas: false,
-  mouseTail: defaultMouseTailConfig,
-};
 
 export class Replayer {
   public wrapper: HTMLDivElement;
@@ -96,13 +88,26 @@ export class Replayer {
     if (!config?.liveMode && events.length < 2) {
       throw new Error('Replayer need at least 2 events.');
     }
+    const defaultConfig: playerConfig = {
+      speed: 1,
+      root: document.body,
+      loadTimeout: 0,
+      skipInactive: false,
+      showWarning: true,
+      showDebug: false,
+      blockClass: 'rr-block',
+      liveMode: false,
+      insertStyleRules: [],
+      triggerFocus: true,
+      UNSAFE_replayCanvas: false,
+      mouseTail: defaultMouseTailConfig,
+    };
     this.config = Object.assign({}, defaultConfig, config);
 
     this.handleResize = this.handleResize.bind(this);
     this.getCastFn = this.getCastFn.bind(this);
     this.emitter.on(ReplayerEvents.Resize, this.handleResize as Handler);
 
-    polyfill();
     this.setupDom();
 
     this.treeIndex = new TreeIndex();
@@ -330,6 +335,8 @@ export class Replayer {
         this.iframe.contentWindow,
         this.iframe.contentDocument,
       );
+
+      polyfill(this.iframe.contentWindow as Window & typeof globalThis);
     }
   }
 
@@ -745,6 +752,24 @@ export class Replayer {
         }
 
         const styleEl = (target as Node) as HTMLStyleElement;
+        const parent = (target.parentNode as unknown) as INode;
+        const usingVirtualParent = this.fragmentParentMap.has(parent);
+        let placeholderNode;
+
+        if (usingVirtualParent) {
+          /**
+           * styleEl.sheet is only accessible if the styleEl is part of the
+           * dom. This doesn't work on DocumentFragments so we have to re-add
+           * it to the dom temporarily.
+           */
+          const domParent = this.fragmentParentMap.get(
+            (target.parentNode as unknown) as INode,
+          );
+          placeholderNode = document.createTextNode('');
+          parent.replaceChild(placeholderNode, target);
+          domParent!.appendChild(target);
+        }
+
         const styleSheet = <CSSStyleSheet>styleEl.sheet;
 
         if (d.adds) {
@@ -775,6 +800,11 @@ export class Replayer {
             }
           });
         }
+
+        if (usingVirtualParent && placeholderNode) {
+          parent.replaceChild(target, placeholderNode);
+        }
+
         break;
       }
       case IncrementalSource.CanvasMutation: {
@@ -861,6 +891,24 @@ export class Replayer {
     };
     const queue: addedNodeMutation[] = [];
 
+    // next not present at this moment
+    function nextNotInDOM(mutation: addedNodeMutation) {
+      let next: Node | null = null;
+      if (mutation.nextId) {
+        next = mirror.getNode(mutation.nextId) as Node;
+      }
+      // next not present at this moment
+      if (
+        mutation.nextId !== null &&
+        mutation.nextId !== undefined &&
+        mutation.nextId !== -1 &&
+        !next
+      ) {
+        return true;
+      }
+      return false;
+    }
+
     const appendNode = (mutation: addedNodeMutation) => {
       if (!this.iframe.contentDocument) {
         return console.warn('Looks like your replayer has been destroyed.');
@@ -870,7 +918,15 @@ export class Replayer {
         return queue.push(mutation);
       }
 
-      const parentInDocument = this.iframe.contentDocument.contains(parent);
+      let parentInDocument = null;
+      if (this.iframe.contentDocument.contains) {
+        parentInDocument = this.iframe.contentDocument.contains(parent);
+      } else if (this.iframe.contentDocument.body.contains) {
+        // fix for IE
+        // refer 'Internet Explorer notes' at https://developer.mozilla.org/zh-CN/docs/Web/API/Document
+        parentInDocument = this.iframe.contentDocument.body.contains(parent);
+      }
+
       if (useVirtualParent && parentInDocument) {
         const virtualParent = (document.createDocumentFragment() as unknown) as INode;
         mirror.map[mutation.parentId] = virtualParent;
@@ -889,13 +945,7 @@ export class Replayer {
       if (mutation.nextId) {
         next = mirror.getNode(mutation.nextId) as Node;
       }
-      // next not present at this moment
-      if (
-        mutation.nextId !== null &&
-        mutation.nextId !== undefined &&
-        mutation.nextId !== -1 &&
-        !next
-      ) {
+      if (nextNotInDOM(mutation)) {
         return queue.push(mutation);
       }
 
@@ -941,12 +991,31 @@ export class Replayer {
       appendNode(mutation);
     });
 
+    let startTime = Date.now();
     while (queue.length) {
-      if (queue.every((m) => !Boolean(mirror.getNode(m.parentId)))) {
-        return queue.forEach((m) => this.warnNodeNotFound(d, m.node.id));
+      // transform queue to resolve tree
+      const resolveTrees = queueToResolveTrees(queue);
+      queue.length = 0;
+      if (Date.now() - startTime > 500) {
+        this.warn(
+          'Timeout in the loop, please check the resolve tree data:',
+          resolveTrees,
+        );
+        break;
       }
-      const mutation = queue.shift()!;
-      appendNode(mutation);
+      for (const tree of resolveTrees) {
+        let parent = mirror.getNode(tree.value.parentId);
+        if (!parent) {
+          this.debug(
+            'Drop resolve tree since there is no parent for the root node.',
+            tree,
+          );
+        } else {
+          iterateResolveTree(tree, (mutation) => {
+            appendNode(mutation);
+          });
+        }
+      }
     }
 
     if (Object.keys(legacy_missingNodeMap).length) {
@@ -977,10 +1046,19 @@ export class Replayer {
       for (const attributeName in mutation.attributes) {
         if (typeof attributeName === 'string') {
           const value = mutation.attributes[attributeName];
-          if (value !== null) {
-            ((target as Node) as Element).setAttribute(attributeName, value);
-          } else {
-            ((target as Node) as Element).removeAttribute(attributeName);
+          try {
+            if (value !== null) {
+              ((target as Node) as Element).setAttribute(attributeName, value);
+            } else {
+              ((target as Node) as Element).removeAttribute(attributeName);
+            }
+          } catch (error) {
+            if (this.config.showWarning) {
+              console.warn(
+                'An error occurred may due to the checkout feature.',
+                error,
+              );
+            }
           }
         }
       }
@@ -1138,10 +1216,7 @@ export class Replayer {
   }
 
   private warnNodeNotFound(d: incrementalData, id: number) {
-    if (!this.config.showWarning) {
-      return;
-    }
-    console.warn(REPLAY_CONSOLE_PREFIX, `Node with id '${id}' not found in`, d);
+    this.warn(`Node with id '${id}' not found in`, d);
   }
 
   private warnCanvasMutationFailed(
@@ -1149,12 +1224,7 @@ export class Replayer {
     id: number,
     error: unknown,
   ) {
-    console.warn(
-      REPLAY_CONSOLE_PREFIX,
-      `Has error on update canvas '${id}'`,
-      d,
-      error,
-    );
+    this.warn(`Has error on update canvas '${id}'`, d, error);
   }
 
   private debugNodeNotFound(d: incrementalData, id: number) {
@@ -1164,10 +1234,21 @@ export class Replayer {
      * is microtask, so events fired on a removed DOM may emit
      * snapshots in the reverse order.
      */
+    this.debug(REPLAY_CONSOLE_PREFIX, `Node with id '${id}' not found in`, d);
+  }
+
+  private warn(...args: Parameters<typeof console.warn>) {
+    if (!this.config.showWarning) {
+      return;
+    }
+    console.warn(REPLAY_CONSOLE_PREFIX, ...args);
+  }
+
+  private debug(...args: Parameters<typeof console.log>) {
     if (!this.config.showDebug) {
       return;
     }
     // tslint:disable-next-line: no-console
-    console.log(REPLAY_CONSOLE_PREFIX, `Node with id '${id}' not found in`, d);
+    console.log(REPLAY_CONSOLE_PREFIX, ...args);
   }
 }

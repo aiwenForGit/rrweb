@@ -4,7 +4,8 @@ import * as puppeteer from 'puppeteer';
 import { assertSnapshot, launchPuppeteer } from './utils';
 import { Suite } from 'mocha';
 import { expect } from 'chai';
-import { recordOptions, eventWithTime } from '../src/types';
+import { recordOptions, eventWithTime, EventType } from '../src/types';
+import { visitSnapshot, NodeType } from 'rrweb-snapshot';
 
 interface ISuite extends Suite {
   code: string;
@@ -139,6 +140,32 @@ describe('record integration tests', function (this: ISuite) {
     assertSnapshot(snapshots, __filename, 'select2');
   });
 
+  it('can freeze mutations', async () => {
+    const page: puppeteer.Page = await this.browser.newPage();
+    await page.goto('about:blank');
+    await page.setContent(getHtml.call(this, 'mutation-observer.html'));
+
+    await page.evaluate(() => {
+      const li = document.createElement('li');
+      const ul = document.querySelector('ul') as HTMLUListElement;
+      ul.appendChild(li);
+      li.setAttribute('foo', 'bar');
+      document.body.setAttribute('test', 'true');
+    });
+    await page.evaluate('rrweb.freezePage()');
+    await page.evaluate(() => {
+      document.body.setAttribute('test', 'bad');
+      const ul = document.querySelector('ul') as HTMLUListElement;
+      const li = document.createElement('li');
+      li.setAttribute('bad-attr', 'bad');
+      li.innerText = 'bad text';
+      ul.appendChild(li);
+      document.body.removeChild(ul);
+    });
+    const snapshots = await page.evaluate('window.snapshots');
+    assertSnapshot(snapshots, __filename, 'frozen');
+  });
+
   it('should not record input events on ignored elements', async () => {
     const page: puppeteer.Page = await this.browser.newPage();
     await page.goto('about:blank');
@@ -245,7 +272,7 @@ describe('record integration tests', function (this: ISuite) {
     assertSnapshot(snapshots, __filename, 'react-styled-components');
   });
 
-  it('should record canvas mutations', async () => {
+  it.only('should record canvas mutations', async () => {
     const page: puppeteer.Page = await this.browser.newPage();
     await page.goto('about:blank');
     await page.setContent(
@@ -255,6 +282,15 @@ describe('record integration tests', function (this: ISuite) {
     );
     await page.waitFor(50);
     const snapshots = await page.evaluate('window.snapshots');
+    for (const event of snapshots) {
+      if (event.type === EventType.FullSnapshot) {
+        visitSnapshot(event.data.node, (n) => {
+          if (n.type === NodeType.Element && n.attributes.rr_dataURL) {
+            n.attributes.rr_dataURL = `LOOKS LIKE WE COULD NOT GET STABLE BASE64 FROM SAME IMAGE.`;
+          }
+        });
+      }
+    }
     assertSnapshot(snapshots, __filename, 'canvas');
   });
 
